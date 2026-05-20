@@ -8,3 +8,6 @@ pretrained_models/
 data/
 notebooks/
 .venv
+/inputs
+matanyone2.pth
+/inputs
