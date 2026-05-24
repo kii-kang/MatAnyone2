@@ -129,6 +129,17 @@ python inference_matanyone2.py -i inputs/video/test-sample2.mp4 -m inputs/mask/t
 - If you want to save the results as per-frame images, you can set `--save-image`.
 - If you want to set a limit for the maximum input resolution, you can set `--max-size`, and the video will be downsampled if min(w, h) exceeds. By default, we don't set the limit.
 
+### Bounding Box from Alpha Masks
+If you save per-frame alpha masks as PNG images, you can convert them to bounding boxes and optionally export sanity-check visualizations with a red rectangle drawn on each mask:
+
+```shell
+python bbox_from_mask.py results/test2_c1/pha --vis-dir results/test2_c1/bbox -o results/test2_c1/test2_c1_bbox.json
+```
+
+- The input directory should contain PNG masks, such as `results/test2_c1/pha`.
+- `--vis-dir` saves visualization images with the computed bbox drawn in red.
+- `-o` writes the bbox metadata to a JSON file.
+
 Or you may directly run via CLI command:
 ```shell
 matanyone2 -i inputs/video/test-sample1 -m inputs/mask/test-sample1.png
