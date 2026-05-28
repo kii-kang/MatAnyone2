@@ -140,6 +140,22 @@ python bbox_from_mask.py results/test2_c1/pha --vis-dir results/test2_c1/bbox -o
 - `--vis-dir` saves visualization images with the computed bbox drawn in red.
 - `-o` writes the bbox metadata to a JSON file.
 
+### Cropped Full-Resolution Inference
+After the first low-resolution pass and bbox extraction, you can run full-resolution inference on cropped regions guided by the bbox JSON:
+
+```shell
+python inference_matanyone2_cropped.py \
+  -i input/video/test2_c1 \
+  --bbox_json results/test2_c1/test2_c1_bbox.json \
+  -o results/test2_c1_cropped
+```
+
+- `-i` should point to the original full-resolution video or frame folder.
+- `--bbox_json` should be the JSON file produced by `bbox_from_mask.py`.
+- The script will save crop-space alpha masks in `pha_crop`, full-frame alpha masks in `pha_full`, raw RGB crops in `rgb_crop`, and crop metadata in `crop_inference_meta.jsonl`.
+- You can enlarge each crop using `--bbox_expand_ratio` and `--bbox_expand_pixels`.
+- If you want cropped intrinsics for downstream pose or reconstruction, pass `--fx --fy --cx --cy`.
+
 Or you may directly run via CLI command:
 ```shell
 matanyone2 -i inputs/video/test-sample1 -m inputs/mask/test-sample1.png

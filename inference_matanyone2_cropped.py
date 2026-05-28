@@ -100,13 +100,9 @@ def load_bbox_entries(bbox_json_path):
     plan_entries = {}
     for entry in entries:
         mask_path = entry.get("mask_path")
-        bbox_xyxy = entry.get("bbox_xyxy")
 
         if not mask_path:
             raise RuntimeError(f"bbox entry is missing mask_path in {bbox_json_path}: {entry}")
-
-        if bbox_xyxy is None:
-            continue
 
         frame_idx = parse_frame_index(mask_path)
         if frame_idx in plan_entries:
@@ -115,9 +111,26 @@ def load_bbox_entries(bbox_json_path):
         plan_entries[frame_idx] = entry
 
     if not plan_entries:
-        raise RuntimeError(f"No non-empty bbox entries found in {bbox_json_path}")
+        raise RuntimeError(f"No bbox entries found in {bbox_json_path}")
 
     return dict(sorted(plan_entries.items()))
+
+
+def bbox_entry_is_valid(entry):
+    return entry.get("bbox_xyxy") is not None and entry.get("bbox_xywh") is not None
+
+
+def find_valid_bbox_frames(bbox_entries):
+    return [frame_idx for frame_idx, entry in bbox_entries.items() if bbox_entry_is_valid(entry)]
+
+
+def find_next_valid_bbox_frame(bbox_entries, start_frame, end_frame):
+    for frame_idx in range(int(start_frame), int(end_frame) + 1):
+        entry = bbox_entries.get(frame_idx)
+        if entry is not None and bbox_entry_is_valid(entry):
+            return frame_idx
+
+    return None
 
 
 def parse_frame_index(mask_path):
@@ -178,9 +191,9 @@ def build_crop_plan_from_bbox_entries(
     plan = {}
 
     for frame_idx, entry in bbox_entries.items():
-        bbox_xyxy = entry.get("bbox_xyxy")
-        if bbox_xyxy is None:
+        if not bbox_entry_is_valid(entry):
             continue
+        bbox_xyxy = entry["bbox_xyxy"]
 
         mask_w = int(entry["width"])
         mask_h = int(entry["height"])
@@ -213,6 +226,104 @@ def build_crop_plan_from_bbox_entries(
         raise RuntimeError("No usable crop boxes could be built from bbox JSON.")
 
     return dict(sorted(plan.items()))
+
+
+def union_boxes(box_a, box_b):
+    if box_a is None:
+        return list(box_b)
+    if box_b is None:
+        return list(box_a)
+
+    return [
+        min(int(box_a[0]), int(box_b[0])),
+        min(int(box_a[1]), int(box_b[1])),
+        max(int(box_a[2]), int(box_b[2])),
+        max(int(box_a[3]), int(box_b[3])),
+    ]
+
+
+def box_area(box):
+    return max(0, int(box[2]) - int(box[0])) * max(0, int(box[3]) - int(box[1]))
+
+
+def box_area_ratio(box, full_w, full_h):
+    frame_area = int(full_w) * int(full_h)
+    if frame_area <= 0:
+        raise RuntimeError(f"Invalid full-frame size: {full_w}x{full_h}")
+    return float(box_area(box)) / float(frame_area)
+
+
+def build_grouped_plan(frame_plan, full_w, full_h, max_union_area_ratio):
+    if not frame_plan:
+        raise RuntimeError("Cannot build grouped plan from an empty frame plan.")
+
+    groups = []
+    current_frames = []
+    current_union = None
+    prev_frame = None
+
+    for frame_idx, entry in sorted(frame_plan.items()):
+        frame_box = list(entry["crop_bbox_original"])
+        proposed_union = union_boxes(current_union, frame_box)
+
+        has_gap = prev_frame is not None and frame_idx != (prev_frame + 1)
+        exceeds_union = (
+            current_union is not None
+            and max_union_area_ratio is not None
+            and max_union_area_ratio > 0
+            and box_area_ratio(proposed_union, full_w, full_h) > float(max_union_area_ratio)
+        )
+
+        if has_gap or exceeds_union:
+            groups.append(
+                {
+                    "frames": current_frames,
+                    "start_frame": current_frames[0],
+                    "end_frame": current_frames[-1],
+                    "group_box": current_union,
+                }
+            )
+            current_frames = [frame_idx]
+            current_union = frame_box
+        else:
+            if not current_frames:
+                current_frames = [frame_idx]
+                current_union = frame_box
+            else:
+                current_frames.append(frame_idx)
+                current_union = proposed_union
+
+        prev_frame = frame_idx
+
+    if current_frames:
+        groups.append(
+            {
+                "frames": current_frames,
+                "start_frame": current_frames[0],
+                "end_frame": current_frames[-1],
+                "group_box": current_union,
+            }
+        )
+
+    grouped_plan = {}
+    for group_id, group in enumerate(groups):
+        group_box = list(group["group_box"])
+        group_ratio = box_area_ratio(group_box, full_w, full_h)
+        group_frame_count = len(group["frames"])
+
+        for frame_idx in group["frames"]:
+            grouped_entry = dict(frame_plan[frame_idx])
+            grouped_entry["frame_crop_bbox_original"] = list(grouped_entry["crop_bbox_original"])
+            grouped_entry["crop_bbox_original"] = list(group_box)
+            grouped_entry["group_bbox_original"] = list(group_box)
+            grouped_entry["group_id"] = int(group_id)
+            grouped_entry["group_start_frame"] = int(group["start_frame"])
+            grouped_entry["group_end_frame"] = int(group["end_frame"])
+            grouped_entry["group_frame_count"] = int(group_frame_count)
+            grouped_entry["group_union_area_ratio"] = float(group_ratio)
+            grouped_plan[frame_idx] = grouped_entry
+
+    return grouped_plan, groups
 
 
 def get_mask_path(mask_dir, frame_idx, digits=4):
@@ -283,6 +394,66 @@ def compute_crop_intrinsics(fx, fy, cx, cy, meta):
     crop_cy = scale * (float(cy) - float(y0)) + float(pad_y)
 
     return build_intrinsics_matrix(crop_fx, crop_fy, crop_cx, crop_cy)
+
+
+def initialize_group_inference(
+    processor,
+    frame,
+    entry,
+    mask_dir,
+    full_w,
+    full_h,
+    target_h,
+    target_w,
+    mask_threshold,
+    r_dilate,
+    r_erode,
+    n_warmup,
+    digits,
+):
+    box = entry["crop_bbox_original"]
+
+    image_crop, meta = crop_and_letterbox_image_chw(
+        frame,
+        box,
+        target_h,
+        target_w,
+    )
+
+    first_mask_path = resolve_first_mask_path(
+        mask_dir,
+        entry,
+        entry["frame"],
+        digits=digits,
+    )
+    first_mask_full = read_binary_mask(
+        first_mask_path,
+        full_w=full_w,
+        full_h=full_h,
+        threshold=mask_threshold,
+    )
+
+    first_mask_crop = crop_and_letterbox_mask_np(
+        first_mask_full,
+        box,
+        target_h,
+        target_w,
+    )
+
+    if r_dilate > 0:
+        first_mask_crop = gen_dilate(first_mask_crop, r_dilate, r_dilate)
+    if r_erode > 0:
+        first_mask_crop = gen_erosion(first_mask_crop, r_erode, r_erode)
+
+    first_mask_torch = torch.from_numpy(first_mask_crop).float().to(device)
+    image_torch = (image_crop / 255.0).float().to(device)
+
+    output_prob = processor.step(image_torch, first_mask_torch, objects=[1])
+
+    for _ in range(int(n_warmup)):
+        output_prob = processor.step(image_torch, first_frame_pred=True)
+
+    return image_crop, meta, output_prob
 
 
 def interpolate_image_chw(img_chw, size_hw):
@@ -437,6 +608,7 @@ def main(
     digits=4,
     bbox_expand_ratio=0.10,
     bbox_expand_pixels=0,
+    group_union_area_ratio=0.20,
     save_crop_rgb=True,
     fx=None,
     fy=None,
@@ -455,6 +627,8 @@ def main(
         raise ValueError("bbox_expand_ratio must be non-negative")
     if bbox_expand_pixels < 0:
         raise ValueError("bbox_expand_pixels must be non-negative")
+    if group_union_area_ratio < 0:
+        raise ValueError("group_union_area_ratio must be non-negative")
 
     intrinsics = [fx, fy, cx, cy]
     has_intrinsics = any(value is not None for value in intrinsics)
@@ -464,17 +638,23 @@ def main(
     if crop_plan:
         plan_source = load_crop_plan(crop_plan)
         plan_source_type = "crop_plan"
+        valid_bbox_frames = None
     else:
         plan_source = load_bbox_entries(bbox_json)
         plan_source_type = "bbox_json"
+        valid_bbox_frames = find_valid_bbox_frames(plan_source)
+        if not valid_bbox_frames:
+            raise RuntimeError(f"No non-empty bbox entries found in {bbox_json}")
 
     plan = None
     available_frames = sorted(plan_source.keys())
 
+    fps, video_length, video_name = get_input_metadata(input_path)
+
     if start_frame is None:
-        start_frame = available_frames[0]
+        start_frame = valid_bbox_frames[0] if plan_source_type == "bbox_json" else available_frames[0]
     if end_frame is None:
-        end_frame = available_frames[-1]
+        end_frame = video_length - 1
 
     start_frame = int(start_frame)
     end_frame = int(end_frame)
@@ -482,12 +662,16 @@ def main(
     if start_frame > end_frame:
         raise ValueError("start_frame must be <= end_frame")
 
-    fps, video_length, video_name = get_input_metadata(input_path)
-
     if start_frame < 0 or start_frame >= video_length:
         raise ValueError(f"start_frame must be inside video range [0, {video_length - 1}]")
 
     end_frame = min(end_frame, video_length - 1)
+
+    if plan_source_type == "bbox_json" and available_frames[-1] < end_frame:
+        warnings.warn(
+            "bbox_json ends before the requested/video frame range. "
+            f"Frames after {available_frames[-1]} will be skipped through {end_frame}."
+        )
 
     crop_pha_dir = Path(output_path) / video_name / "pha_crop"
     crop_fgr_dir = Path(output_path) / video_name / "fgr_crop"
@@ -509,7 +693,7 @@ def main(
         ckpt_path = load_file_from_url(pretrain_model_url, "pretrained_models")
 
     matanyone2 = get_matanyone2_model(ckpt_path, device)
-    processor = InferenceCore(matanyone2, cfg=matanyone2.cfg)
+    processor = None
 
     r_erode = int(r_erode)
     r_dilate = int(r_dilate)
@@ -526,68 +710,66 @@ def main(
 
     if plan_source_type == "crop_plan":
         plan = plan_source
+        processor = InferenceCore(matanyone2, cfg=matanyone2.cfg)
     else:
-        plan = build_crop_plan_from_bbox_entries(
+        frame_plan = build_crop_plan_from_bbox_entries(
             plan_source,
             full_w=full_w,
             full_h=full_h,
             expand_ratio=bbox_expand_ratio,
             expand_pixels=bbox_expand_pixels,
         )
+        plan, groups = build_grouped_plan(
+            frame_plan,
+            full_w=full_w,
+            full_h=full_h,
+            max_union_area_ratio=group_union_area_ratio,
+        )
+
+        if start_frame not in plan:
+            next_valid_frame = find_next_valid_bbox_frame(plan_source, start_frame, end_frame)
+            if next_valid_frame is None:
+                raise RuntimeError(
+                    f"No valid bbox found between frames {start_frame} and {end_frame}."
+                )
+            warnings.warn(
+                f"Start frame {start_frame} has a null bbox. "
+                f"Frames through {next_valid_frame - 1} will be skipped; "
+                f"the first initialized group starts at frame {next_valid_frame}."
+            )
+
+        print(
+            f"Using grouped cropped inference with {len(groups)} group(s); "
+            f"group_union_area_ratio={group_union_area_ratio:.3f}."
+        )
 
     frame_paths = None
     if not is_video_input_path(input_path):
         frame_paths = list_frame_paths(input_path)
 
-    if start_frame not in plan:
-        raise RuntimeError(f"Start frame {start_frame} is not present in crop plan")
+    if plan_source_type == "crop_plan":
+        if start_frame not in plan:
+            raise RuntimeError(f"Start frame {start_frame} is not present in crop plan")
 
-    first_box = plan[start_frame]["crop_bbox_original"]
-
-    first_image_crop, first_meta = crop_and_letterbox_image_chw(
-        reference_frame,
-        first_box,
-        target_h,
-        target_w,
-    )
-
-    first_mask_path = resolve_first_mask_path(
-        mask_dir,
-        plan[start_frame],
-        start_frame,
-        digits=digits,
-    )
-    first_mask_full = read_binary_mask(
-        first_mask_path,
-        full_w=full_w,
-        full_h=full_h,
-        threshold=mask_threshold,
-    )
-
-    first_mask_crop = crop_and_letterbox_mask_np(
-        first_mask_full,
-        first_box,
-        target_h,
-        target_w,
-    )
-
-    if r_dilate > 0:
-        first_mask_crop = gen_dilate(first_mask_crop, r_dilate, r_dilate)
-    if r_erode > 0:
-        first_mask_crop = gen_erosion(first_mask_crop, r_erode, r_erode)
-
-    first_mask_torch = torch.from_numpy(first_mask_crop).float().to(device)
-
-    objects = [1]
-
-    image_torch = (first_image_crop / 255.0).float().to(device)
-
-    # Encode initial mask.
-    output_prob = processor.step(image_torch, first_mask_torch, objects=objects)
-
-    # Warm up / stabilize first-frame prediction.
-    for _ in tqdm(range(n_warmup), desc="Warmup"):
-        output_prob = processor.step(image_torch, first_frame_pred=True)
+        first_image_crop, first_meta, output_prob = initialize_group_inference(
+            processor,
+            reference_frame,
+            plan[start_frame],
+            mask_dir=mask_dir,
+            full_w=full_w,
+            full_h=full_h,
+            target_h=target_h,
+            target_w=target_w,
+            mask_threshold=mask_threshold,
+            r_dilate=r_dilate,
+            r_erode=r_erode,
+            n_warmup=n_warmup,
+            digits=digits,
+        )
+    else:
+        first_image_crop = None
+        first_meta = None
+        output_prob = None
 
     crop_fgr_writer = imageio.get_writer(
         str(Path(output_path) / f"{video_name}_crop_fgr.mp4"),
@@ -610,17 +792,16 @@ def main(
 
     meta_jsonl_path = meta_dir / "crop_inference_meta.jsonl"
 
-    last_plan_entry = plan[start_frame]
+    skipped_frames = 0
+    last_plan_entry = plan[start_frame] if plan_source_type == "crop_plan" and start_frame in plan else None
+    active_group_id = None
 
     try:
         with open(meta_jsonl_path, "w") as meta_f:
             for frame_idx in tqdm(range(start_frame, end_frame + 1), desc="Cropped MatAnyone2 inference"):
 
                 if frame_idx == start_frame:
-                    entry = plan[start_frame]
                     frame = reference_frame
-                    image_crop = first_image_crop
-                    meta = first_meta
                 else:
                     try:
                         frame = next(frame_iter).float()
@@ -628,24 +809,69 @@ def main(
                         print(f"Stopped early at frame {frame_idx}")
                         break
 
+                if plan_source_type == "bbox_json":
+                    source_entry = plan_source.get(frame_idx)
+                    if source_entry is None or not bbox_entry_is_valid(source_entry):
+                        skipped_frames += 1
+                        continue
                     entry = plan.get(frame_idx)
                     if entry is None:
-                        # Missing mask/crop plan. Carry previous crop.
-                        entry = last_plan_entry
+                        skipped_frames += 1
+                        continue
+
+                    if active_group_id != entry["group_id"]:
+                        processor = InferenceCore(matanyone2, cfg=matanyone2.cfg)
+                        active_group_id = entry["group_id"]
+                        image_crop, meta, output_prob = initialize_group_inference(
+                            processor,
+                            frame,
+                            entry,
+                            mask_dir=mask_dir,
+                            full_w=full_w,
+                            full_h=full_h,
+                            target_h=target_h,
+                            target_w=target_w,
+                            mask_threshold=mask_threshold,
+                            r_dilate=r_dilate,
+                            r_erode=r_erode,
+                            n_warmup=n_warmup,
+                            digits=digits,
+                        )
                     else:
-                        last_plan_entry = entry
+                        box = entry["crop_bbox_original"]
+                        image_crop, meta = crop_and_letterbox_image_chw(
+                            frame,
+                            box,
+                            target_h,
+                            target_w,
+                        )
 
-                    box = entry["crop_bbox_original"]
+                        image_torch = (image_crop / 255.0).float().to(device)
+                        output_prob = processor.step(image_torch)
+                else:
+                    if frame_idx == start_frame:
+                        entry = plan[start_frame]
+                        image_crop = first_image_crop
+                        meta = first_meta
+                    else:
+                        entry = plan.get(frame_idx)
+                        if entry is None:
+                            # Missing legacy crop-plan entry. Carry previous crop.
+                            entry = last_plan_entry
+                        else:
+                            last_plan_entry = entry
 
-                    image_crop, meta = crop_and_letterbox_image_chw(
-                        frame,
-                        box,
-                        target_h,
-                        target_w,
-                    )
+                        box = entry["crop_bbox_original"]
 
-                    image_torch = (image_crop / 255.0).float().to(device)
-                    output_prob = processor.step(image_torch)
+                        image_crop, meta = crop_and_letterbox_image_chw(
+                            frame,
+                            box,
+                            target_h,
+                            target_w,
+                        )
+
+                        image_torch = (image_crop / 255.0).float().to(device)
+                        output_prob = processor.step(image_torch)
 
                 pred_mask = processor.output_prob_to_mask(output_prob)
 
@@ -703,6 +929,8 @@ def main(
                     "frame": frame_idx,
                     "crop_box_frame_source": entry["frame"],
                     "box_original": meta["box"],
+                    "frame_crop_bbox_original": entry.get("frame_crop_bbox_original"),
+                    "group_bbox_original": entry.get("group_bbox_original"),
                     "crop_size": meta["crop_size"],
                     "target_size": meta["target_size"],
                     "scale": meta["scale"],
@@ -721,6 +949,11 @@ def main(
                     "crop_source": plan_source_type,
                     "bbox_expand_ratio": float(bbox_expand_ratio) if plan_source_type == "bbox_json" else None,
                     "bbox_expand_pixels": int(bbox_expand_pixels) if plan_source_type == "bbox_json" else None,
+                    "group_id": entry.get("group_id"),
+                    "group_start_frame": entry.get("group_start_frame"),
+                    "group_end_frame": entry.get("group_end_frame"),
+                    "group_frame_count": entry.get("group_frame_count"),
+                    "group_union_area_ratio": entry.get("group_union_area_ratio"),
                 }
 
                 if plan_source_type == "bbox_json":
@@ -749,6 +982,8 @@ def main(
     if save_full_pha:
         print(f"Full-frame alpha frames: {full_pha_dir}")
     print(f"Metadata: {meta_jsonl_path}")
+    if skipped_frames > 0:
+        print(f"Skipped frames with null/missing bbox: {skipped_frames}")
 
 
 if __name__ == "__main__":
@@ -789,7 +1024,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bbox_expand_ratio",
         type=float,
-        default=0.10,
+        default=0.25,
         help="Extra relative padding added around each bbox when using --bbox_json.",
     )
     parser.add_argument(
@@ -797,6 +1032,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Extra absolute padding in full-resolution pixels when using --bbox_json.",
+    )
+    parser.add_argument(
+        "--group_union_area_ratio",
+        type=float,
+        default=0.20,
+        help="Start a new fixed-crop group when the union box area exceeds this frame-area ratio.",
     )
     parser.add_argument(
         "--no_save_crop_rgb",
@@ -842,6 +1083,7 @@ if __name__ == "__main__":
         digits=args.digits,
         bbox_expand_ratio=args.bbox_expand_ratio,
         bbox_expand_pixels=args.bbox_expand_pixels,
+        group_union_area_ratio=args.group_union_area_ratio,
         save_crop_rgb=not args.no_save_crop_rgb,
         fx=args.fx,
         fy=args.fy,
