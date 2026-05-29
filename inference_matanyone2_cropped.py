@@ -354,7 +354,13 @@ def read_binary_mask(mask_path, full_w, full_h, threshold=8):
     return mask
 
 
-def resolve_first_mask_path(mask_dir, plan_entry, frame_idx, digits=4):
+def resolve_first_mask_path(mask_dir, plan_entry, frame_idx, digits=4, mask_path_override=None):
+    if mask_path_override:
+        mask_path = Path(mask_path_override)
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Provided mask path does not exist: {mask_path}")
+        return mask_path
+
     if mask_dir:
         return get_mask_path(mask_dir, frame_idx, digits=digits)
 
@@ -401,6 +407,7 @@ def initialize_group_inference(
     frame,
     entry,
     mask_dir,
+    mask_path_override,
     full_w,
     full_h,
     target_h,
@@ -425,6 +432,7 @@ def initialize_group_inference(
         entry,
         entry["frame"],
         digits=digits,
+        mask_path_override=mask_path_override,
     )
     first_mask_full = read_binary_mask(
         first_mask_path,
@@ -590,6 +598,7 @@ def main(
     input_path,
     output_path,
     mask_dir=None,
+    mask_path=None,
     crop_plan=None,
     bbox_json=None,
     ckpt_path="pretrained_models/matanyone2.pth",
@@ -747,6 +756,8 @@ def main(
     if not is_video_input_path(input_path):
         frame_paths = list_frame_paths(input_path)
 
+    pending_mask_path_override = mask_path
+
     if plan_source_type == "crop_plan":
         if start_frame not in plan:
             raise RuntimeError(f"Start frame {start_frame} is not present in crop plan")
@@ -756,6 +767,7 @@ def main(
             reference_frame,
             plan[start_frame],
             mask_dir=mask_dir,
+            mask_path_override=pending_mask_path_override,
             full_w=full_w,
             full_h=full_h,
             target_h=target_h,
@@ -766,6 +778,7 @@ def main(
             n_warmup=n_warmup,
             digits=digits,
         )
+        pending_mask_path_override = None
     else:
         first_image_crop = None
         first_meta = None
@@ -827,6 +840,7 @@ def main(
                             frame,
                             entry,
                             mask_dir=mask_dir,
+                            mask_path_override=pending_mask_path_override,
                             full_w=full_w,
                             full_h=full_h,
                             target_h=target_h,
@@ -837,6 +851,7 @@ def main(
                             n_warmup=n_warmup,
                             digits=digits,
                         )
+                        pending_mask_path_override = None
                     else:
                         box = entry["crop_bbox_original"]
                         image_crop, meta = crop_and_letterbox_image_chw(
@@ -996,6 +1011,12 @@ if __name__ == "__main__":
         help="Directory of low-res/full-res masks named 0000.png etc. Optional when --bbox_json is used.",
     )
     parser.add_argument(
+        "-m",
+        "--mask_path",
+        default=None,
+        help="Optional initialization mask for the first processed frame/group. Overrides --mask_dir only once.",
+    )
+    parser.add_argument(
         "--crop_plan",
         default=None,
         help="Legacy JSONL crop plan with per-frame crop_bbox_original entries.",
@@ -1068,13 +1089,14 @@ if __name__ == "__main__":
     if bool(args.crop_plan) == bool(args.bbox_json):
         parser.error("Specify exactly one of --crop_plan or --bbox_json.")
 
-    if args.crop_plan and not args.mask_dir:
-        parser.error("--mask_dir is required when using --crop_plan.")
+    if args.crop_plan and not (args.mask_dir or args.mask_path):
+        parser.error("Either --mask_dir or --mask_path is required when using --crop_plan.")
 
     main(
         input_path=args.input_path,
         output_path=args.output_path,
         mask_dir=args.mask_dir,
+        mask_path=args.mask_path,
         crop_plan=args.crop_plan,
         bbox_json=args.bbox_json,
         ckpt_path=args.ckpt_path,
