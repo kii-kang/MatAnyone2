@@ -770,6 +770,15 @@ def main(
             expand_ratio=bbox_expand_ratio,
             expand_pixels=bbox_expand_pixels,
         )
+        frame_plan = {
+            frame_idx: entry
+            for frame_idx, entry in frame_plan.items()
+            if start_frame <= int(frame_idx) <= end_frame
+        }
+        if not frame_plan:
+            raise RuntimeError(
+                f"No valid bbox crop boxes remain within frames {start_frame} - {end_frame}."
+            )
         plan, groups = build_grouped_plan(
             frame_plan,
             full_w=full_w,
