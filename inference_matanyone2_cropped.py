@@ -1008,8 +1008,18 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output_path", default="results_cropped/", help="Output folder.")
     parser.add_argument("-c", "--ckpt_path", default="pretrained_models/matanyone2.pth")
 
-    parser.add_argument("--start_frame", type=int, default=None)
-    parser.add_argument("--end_frame", type=int, default=None)
+    parser.add_argument(
+        "--start_frame",
+        type=int,
+        default=None,
+        help="Frame index to start cropped inference from. Frames before this index are skipped.",
+    )
+    parser.add_argument(
+        "--end_frame",
+        type=int,
+        default=None,
+        help="Optional last frame index to process. Defaults to the end of the input sequence.",
+    )
 
     parser.add_argument("--target_size", type=int, default=1024, help="Square crop inference size.")
     parser.add_argument("--target_width", type=int, default=None)
