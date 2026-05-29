@@ -147,6 +147,7 @@ After the first low-resolution pass and bbox extraction, you can run full-resolu
 python inference_matanyone2_cropped.py \
   -i input/video/test2_c1 \
   --bbox_json results/test2_c1/test2_c1_bbox.json \
+  --group_init_mask 0=inputs/mask/test2_c1_f0000.png \
   -o results/test2_c1_cropped
 ```
 
@@ -157,12 +158,15 @@ python inference_matanyone2_cropped.py \
   -i input/video/test2_c1 \
   --bbox_json results/test2_c1/test2_c1_bbox.json \
   --start_frame 120 \
+  --group_init_mask 120=inputs/mask/test2_c1_f0120.png \
   -o results/test2_c1_cropped
 ```
 
 - `-i` should point to the original full-resolution video or frame folder.
 - `--bbox_json` should be the JSON file produced by `bbox_from_mask.py`.
 - `--start_frame` skips all earlier frames, similar to `inference_matanyone2.py`.
+- `--group_init_mask FRAME=PATH` explicitly assigns the initialization mask for each group start frame used in the current run. Repeat it once per group.
+- The script prints the computed grouping before inference starts, e.g. `Group 1: frame N - frame M`.
 - The script will save crop-space alpha masks in `pha_crop`, full-frame alpha masks in `pha_full`, raw RGB crops in `rgb_crop`, and crop metadata in `crop_inference_meta.jsonl`.
 - You can enlarge each crop using `--bbox_expand_ratio` and `--bbox_expand_pixels`.
 - If you want cropped intrinsics for downstream pose or reconstruction, pass `--fx --fy --cx --cy`.

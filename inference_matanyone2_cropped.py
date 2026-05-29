@@ -310,6 +310,9 @@ def build_grouped_plan(frame_plan, full_w, full_h, max_union_area_ratio):
         group_box = list(group["group_box"])
         group_ratio = box_area_ratio(group_box, full_w, full_h)
         group_frame_count = len(group["frames"])
+        group["group_id"] = int(group_id)
+        group["group_union_area_ratio"] = float(group_ratio)
+        group["group_frame_count"] = int(group_frame_count)
 
         for frame_idx in group["frames"]:
             grouped_entry = dict(frame_plan[frame_idx])
@@ -326,22 +329,80 @@ def build_grouped_plan(frame_plan, full_w, full_h, max_union_area_ratio):
     return grouped_plan, groups
 
 
-def get_mask_path(mask_dir, frame_idx, digits=4):
-    mask_dir = Path(mask_dir)
+def build_effective_groups(groups, start_frame, end_frame):
+    effective_groups = []
 
-    candidates = [
-        mask_dir / f"{frame_idx:0{digits}d}.png",
-        mask_dir / f"{frame_idx}.png",
-    ]
+    for group in groups:
+        frames_in_run = [
+            int(frame_idx)
+            for frame_idx in group["frames"]
+            if int(start_frame) <= int(frame_idx) <= int(end_frame)
+        ]
+        if not frames_in_run:
+            continue
 
-    for p in candidates:
-        if p.exists():
-            return p
+        effective_groups.append(
+            {
+                "group_id": int(len(effective_groups)),
+                "source_group_id": int(group.get("group_id", len(effective_groups))),
+                "start_frame": int(frames_in_run[0]),
+                "end_frame": int(frames_in_run[-1]),
+                "init_frame": int(frames_in_run[0]),
+                "frame_count": int(len(frames_in_run)),
+                "group_box": list(group["group_box"]),
+                "group_union_area_ratio": group.get("group_union_area_ratio"),
+            }
+        )
 
-    raise FileNotFoundError(f"No mask found for frame {frame_idx} in {mask_dir}")
+    return effective_groups
 
 
-def read_binary_mask(mask_path, full_w, full_h, threshold=8):
+def print_group_summary(effective_groups):
+    print("Grouped frames for this run:")
+    for group in effective_groups:
+        print(
+            f"  Group {group['group_id'] + 1}: frame {group['start_frame']} - frame {group['end_frame']} "
+            f"(init frame {group['init_frame']}, {group['frame_count']} frame(s))"
+        )
+
+
+def parse_group_init_masks(specs):
+    mapping = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            raise ValueError(
+                f"Invalid --group_init_mask value: {spec!r}. "
+                "Expected FRAME=PATH, for example 148=inputs/mask/test2_c2_f148.png"
+            )
+
+        frame_text, mask_text = spec.split("=", 1)
+        try:
+            frame_idx = int(frame_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid frame index in --group_init_mask value: {spec!r}"
+            ) from exc
+
+        mask_path = Path(mask_text)
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Init mask does not exist: {mask_path}")
+
+        mapping[frame_idx] = str(mask_path)
+
+    return mapping
+
+
+def require_group_init_mask(group_init_masks, frame_idx):
+    mask_path = group_init_masks.get(int(frame_idx))
+    if not mask_path:
+        raise RuntimeError(
+            f"Missing init mask for frame {frame_idx}. "
+            "Provide one with --group_init_mask FRAME=PATH."
+        )
+    return Path(mask_path)
+
+
+def read_initial_mask(mask_path, full_w, full_h, threshold=8):
     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise RuntimeError(f"Could not read mask: {mask_path}")
@@ -350,29 +411,9 @@ def read_binary_mask(mask_path, full_w, full_h, threshold=8):
     if mask.shape[1] != full_w or mask.shape[0] != full_h:
         mask = cv2.resize(mask, (full_w, full_h), interpolation=cv2.INTER_NEAREST)
 
-    mask = (mask > threshold).astype(np.uint8) * 255
+    if threshold is not None and int(threshold) > 0:
+        mask = np.where(mask > int(threshold), mask, 0).astype(np.uint8)
     return mask
-
-
-def resolve_first_mask_path(mask_dir, plan_entry, frame_idx, digits=4, mask_path_override=None):
-    if mask_path_override:
-        mask_path = Path(mask_path_override)
-        if not mask_path.exists():
-            raise FileNotFoundError(f"Provided mask path does not exist: {mask_path}")
-        return mask_path
-
-    if mask_dir:
-        return get_mask_path(mask_dir, frame_idx, digits=digits)
-
-    mask_path = plan_entry.get("mask_path")
-    if not mask_path:
-        raise RuntimeError("mask_dir is required unless bbox JSON provides a mask_path for the start frame.")
-
-    mask_path = Path(mask_path)
-    if not mask_path.exists():
-        raise FileNotFoundError(f"Mask path from bbox JSON does not exist: {mask_path}")
-
-    return mask_path
 
 
 def image_chw_to_rgb_u8(image_chw):
@@ -406,8 +447,7 @@ def initialize_group_inference(
     processor,
     frame,
     entry,
-    mask_dir,
-    mask_path_override,
+    first_mask_path,
     full_w,
     full_h,
     target_h,
@@ -427,14 +467,7 @@ def initialize_group_inference(
         target_w,
     )
 
-    first_mask_path = resolve_first_mask_path(
-        mask_dir,
-        entry,
-        entry["frame"],
-        digits=digits,
-        mask_path_override=mask_path_override,
-    )
-    first_mask_full = read_binary_mask(
+    first_mask_full = read_initial_mask(
         first_mask_path,
         full_w=full_w,
         full_h=full_h,
@@ -457,6 +490,7 @@ def initialize_group_inference(
     image_torch = (image_crop / 255.0).float().to(device)
 
     output_prob = processor.step(image_torch, first_mask_torch, objects=[1])
+    output_prob = processor.step(image_torch, first_frame_pred=True)
 
     for _ in range(int(n_warmup)):
         output_prob = processor.step(image_torch, first_frame_pred=True)
@@ -537,7 +571,7 @@ def crop_and_letterbox_mask_np(mask_full, box, target_h, target_w):
     new_w = max(1, int(round(crop_w * scale)))
     new_h = max(1, int(round(crop_h * scale)))
 
-    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
     canvas = np.zeros((target_h, target_w), dtype=np.uint8)
 
@@ -597,8 +631,7 @@ def mask_to_composite(image_chw, mask_torch):
 def main(
     input_path,
     output_path,
-    mask_dir=None,
-    mask_path=None,
+    group_init_masks=None,
     crop_plan=None,
     bbox_json=None,
     ckpt_path="pretrained_models/matanyone2.pth",
@@ -720,6 +753,15 @@ def main(
     if plan_source_type == "crop_plan":
         plan = plan_source
         processor = InferenceCore(matanyone2, cfg=matanyone2.cfg)
+        effective_groups = [
+            {
+                "group_id": 0,
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
+                "init_frame": int(start_frame),
+                "frame_count": int(end_frame - start_frame + 1),
+            }
+        ]
     else:
         frame_plan = build_crop_plan_from_bbox_entries(
             plan_source,
@@ -751,23 +793,53 @@ def main(
             f"Using grouped cropped inference with {len(groups)} group(s); "
             f"group_union_area_ratio={group_union_area_ratio:.3f}."
         )
+        effective_groups = build_effective_groups(groups, start_frame=start_frame, end_frame=end_frame)
+
+    if not effective_groups:
+        raise RuntimeError(
+            f"No groups remain within the requested frame range {start_frame} - {end_frame}."
+        )
+
+    print_group_summary(effective_groups)
+
+    required_init_frames = [int(group["init_frame"]) for group in effective_groups]
+    missing_init_frames = [
+        frame_idx for frame_idx in required_init_frames
+        if int(frame_idx) not in (group_init_masks or {})
+    ]
+    if missing_init_frames:
+        missing_text = ", ".join(str(frame_idx) for frame_idx in missing_init_frames)
+        raise RuntimeError(
+            "Missing explicit init masks for group start frame(s): "
+            f"{missing_text}. Provide one --group_init_mask FRAME=PATH for each listed frame."
+        )
+
+    unused_init_frames = sorted(
+        frame_idx for frame_idx in (group_init_masks or {})
+        if int(frame_idx) not in required_init_frames
+    )
+    if unused_init_frames:
+        warnings.warn(
+            "Ignoring --group_init_mask assignment(s) for frame(s) that are not group starts in this run: "
+            + ", ".join(str(frame_idx) for frame_idx in unused_init_frames)
+        )
 
     frame_paths = None
     if not is_video_input_path(input_path):
         frame_paths = list_frame_paths(input_path)
 
-    pending_mask_path_override = mask_path
-
     if plan_source_type == "crop_plan":
         if start_frame not in plan:
             raise RuntimeError(f"Start frame {start_frame} is not present in crop plan")
 
+        first_mask_path = require_group_init_mask(group_init_masks or {}, start_frame)
+        current_group_init_frame = int(start_frame)
+        current_group_init_mask_path = str(first_mask_path)
         first_image_crop, first_meta, output_prob = initialize_group_inference(
             processor,
             reference_frame,
             plan[start_frame],
-            mask_dir=mask_dir,
-            mask_path_override=pending_mask_path_override,
+            first_mask_path=first_mask_path,
             full_w=full_w,
             full_h=full_h,
             target_h=target_h,
@@ -778,7 +850,6 @@ def main(
             n_warmup=n_warmup,
             digits=digits,
         )
-        pending_mask_path_override = None
     else:
         first_image_crop = None
         first_meta = None
@@ -812,7 +883,6 @@ def main(
     try:
         with open(meta_jsonl_path, "w") as meta_f:
             for frame_idx in tqdm(range(start_frame, end_frame + 1), desc="Cropped MatAnyone2 inference"):
-
                 if frame_idx == start_frame:
                     frame = reference_frame
                 else:
@@ -835,12 +905,14 @@ def main(
                     if active_group_id != entry["group_id"]:
                         processor = InferenceCore(matanyone2, cfg=matanyone2.cfg)
                         active_group_id = entry["group_id"]
+                        first_mask_path = require_group_init_mask(group_init_masks or {}, frame_idx)
+                        current_group_init_frame = int(frame_idx)
+                        current_group_init_mask_path = str(first_mask_path)
                         image_crop, meta, output_prob = initialize_group_inference(
                             processor,
                             frame,
                             entry,
-                            mask_dir=mask_dir,
-                            mask_path_override=pending_mask_path_override,
+                            first_mask_path=first_mask_path,
                             full_w=full_w,
                             full_h=full_h,
                             target_h=target_h,
@@ -851,7 +923,6 @@ def main(
                             n_warmup=n_warmup,
                             digits=digits,
                         )
-                        pending_mask_path_override = None
                     else:
                         box = entry["crop_bbox_original"]
                         image_crop, meta = crop_and_letterbox_image_chw(
@@ -969,6 +1040,8 @@ def main(
                     "group_end_frame": entry.get("group_end_frame"),
                     "group_frame_count": entry.get("group_frame_count"),
                     "group_union_area_ratio": entry.get("group_union_area_ratio"),
+                    "group_init_frame": current_group_init_frame,
+                    "group_init_mask_path": current_group_init_mask_path,
                 }
 
                 if plan_source_type == "bbox_json":
@@ -1005,17 +1078,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("-i", "--input_path", required=True, help="Original full-resolution video or frame folder.")
-    parser.add_argument(
-        "--mask_dir",
-        default=None,
-        help="Directory of low-res/full-res masks named 0000.png etc. Optional when --bbox_json is used.",
-    )
-    parser.add_argument(
-        "-m",
-        "--mask_path",
-        default=None,
-        help="Optional initialization mask for the first processed frame/group. Overrides --mask_dir only once.",
-    )
     parser.add_argument(
         "--crop_plan",
         default=None,
@@ -1071,6 +1133,12 @@ if __name__ == "__main__":
         help="Start a new fixed-crop group when the union box area exceeds this frame-area ratio.",
     )
     parser.add_argument(
+        "--group_init_mask",
+        action="append",
+        default=[],
+        help="Explicit init mask assignment for a group start frame, formatted as FRAME=PATH. Repeat once per group.",
+    )
+    parser.add_argument(
         "--no_save_crop_rgb",
         action="store_true",
         help="Disable saving raw RGB crop images under rgb_crop.",
@@ -1089,14 +1157,10 @@ if __name__ == "__main__":
     if bool(args.crop_plan) == bool(args.bbox_json):
         parser.error("Specify exactly one of --crop_plan or --bbox_json.")
 
-    if args.crop_plan and not (args.mask_dir or args.mask_path):
-        parser.error("Either --mask_dir or --mask_path is required when using --crop_plan.")
-
     main(
         input_path=args.input_path,
         output_path=args.output_path,
-        mask_dir=args.mask_dir,
-        mask_path=args.mask_path,
+        group_init_masks=parse_group_init_masks(args.group_init_mask),
         crop_plan=args.crop_plan,
         bbox_json=args.bbox_json,
         ckpt_path=args.ckpt_path,
