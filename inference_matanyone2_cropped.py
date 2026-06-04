@@ -718,11 +718,13 @@ def main(
     crop_pha_dir = Path(output_path) / video_name / "pha_crop"
     crop_fgr_dir = Path(output_path) / video_name / "fgr_crop"
     crop_rgb_dir = Path(output_path) / video_name / "rgb_crop"
+    full_rgb_dir = Path(output_path) / video_name / "rgb_full"
     full_pha_dir = Path(output_path) / video_name / "pha_full"
     meta_dir = Path(output_path) / video_name
 
     crop_pha_dir.mkdir(parents=True, exist_ok=True)
     crop_fgr_dir.mkdir(parents=True, exist_ok=True)
+    full_rgb_dir.mkdir(parents=True, exist_ok=True)
     if save_crop_rgb:
         crop_rgb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -770,6 +772,15 @@ def main(
             expand_ratio=bbox_expand_ratio,
             expand_pixels=bbox_expand_pixels,
         )
+        frame_plan = {
+            frame_idx: entry
+            for frame_idx, entry in frame_plan.items()
+            if start_frame <= int(frame_idx) <= end_frame
+        }
+        if not frame_plan:
+            raise RuntimeError(
+                f"No valid bbox crop boxes remain within frames {start_frame} - {end_frame}."
+            )
         plan, groups = build_grouped_plan(
             frame_plan,
             full_w=full_w,
@@ -982,6 +993,13 @@ def main(
                         crop_rgb[..., [2, 1, 0]],
                     )
 
+                full_rgb_path = full_rgb_dir / frame_name
+                full_rgb = image_chw_to_rgb_u8(frame)
+                cv2.imwrite(
+                    str(full_rgb_path),
+                    full_rgb[..., [2, 1, 0]],
+                )
+
                 if save_crop_images:
                     cv2.imwrite(
                         str(crop_fgr_dir / frame_name),
@@ -1031,6 +1049,7 @@ def main(
                     "input_video_path": frame_source_info["input_video_path"],
                     "pha_crop_path": str(crop_pha_dir / frame_name),
                     "crop_rgb_path": str(crop_rgb_path) if crop_rgb_path else None,
+                    "rgb_full_path": str(full_rgb_path),
                     "pha_full_path": str(full_pha_path) if full_pha_path else None,
                     "crop_source": plan_source_type,
                     "bbox_expand_ratio": float(bbox_expand_ratio) if plan_source_type == "bbox_json" else None,
@@ -1067,6 +1086,7 @@ def main(
 
     print(f"Done.")
     print(f"Crop alpha frames: {crop_pha_dir}")
+    print(f"Full-frame RGB frames: {full_rgb_dir}")
     if save_full_pha:
         print(f"Full-frame alpha frames: {full_pha_dir}")
     print(f"Metadata: {meta_jsonl_path}")
